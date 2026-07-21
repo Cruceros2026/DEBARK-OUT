@@ -128,6 +128,9 @@
   .add-pax button { padding: 8px 12px; border: none; border-radius: var(--radius-sm); background: var(--accent, #2563eb); color: #fff; font-size: 13px; font-weight: 600; cursor: pointer; white-space: nowrap; }
   .rm-btn { border: none; background: var(--red-bg); color: var(--red-txt); border-radius: 50%; width: 26px; height: 26px; font-size: 13px; cursor: pointer; flex-shrink: 0; }
   .tag-blue { background: #dbeafe; color: #1e40af; }
+  /* sección de pool compartido dentro de la tarjeta de van */
+  .pool-sec { border-top: 0.5px solid var(--border); background: var(--bg3); }
+  .pool-head { padding: 10px 16px 4px; font-size: 13px; font-weight: 600; color: var(--txt); }
   /* departure summary modal */
   .modal-overlay { position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:200;display:flex;align-items:flex-end; }
   .modal { background:var(--bg);border-radius:20px 20px 0 0;padding:20px 16px 32px;width:100%;max-height:88vh;overflow-y:auto; }
@@ -466,11 +469,15 @@ function readVehicles() {
     const icon = selects[0] ? selects[0].value : '🚌';
     const hotel = (inputs[1] ? inputs[1].value.trim() : '') || '';
     const capacity = parseInt((inputs[2] ? inputs[2].value : '') || '14') || 14;
-    // "Van 2 - 3" se divide en dos vehículos (cada uno con su guía)
+    // "Van 2 - 3" se divide en dos vehículos (cada uno con su guía),
+    // y quedan marcados como grupo para que compartan sus pasajeros.
     const names = expandVehicleName(rawName || ('Vehículo ' + (i + 1)));
+    const gKey = names.length > 1
+      ? names.map(n => (String(n).match(/\d+/) || [''])[0]).join('-')
+      : null;
     names.forEach(nm => {
       counter++;
-      result.push({ id: 'v' + counter, icon, name: nm, hotel, capacity });
+      result.push({ id: 'v' + counter, icon, name: nm, hotel, capacity, groupKey: gKey });
     });
   });
   return result;
@@ -622,22 +629,54 @@ function vehicleNum(v) {
 // Reconstruye los grupos a partir de los pasajeros con bus múltiple.
 function buildGroups() {
   const map = {};
+
+  // 1) Grupos declarados en los VEHÍCULOS (ej. escribiste "Van 1 - 2").
+  //    Junta a los pasajeros de esas vans aunque el Excel los traiga separados.
+  const byKey = {};
+  state.vehicles.forEach(v => { if (v.groupKey) (byKey[v.groupKey] = byKey[v.groupKey] || []).push(v); });
+  Object.keys(byKey).forEach(key => {
+    const nums = key.split('-').map(Number).filter(n => !isNaN(n));
+    if (nums.length < 2) return;
+    map[key] = { id: 'grp-' + key, key, nums, paxIds: [] };
+  });
+
+  // 2) Grupos que vienen del Excel (columna tipo "VAN 1 - 2")
   state.pax.forEach(p => {
     if (!p.busMulti || !p.busNums || p.busNums.length < 2) return;
     const key = p.busNums.join('-');
     if (!map[key]) map[key] = { id: 'grp-' + key, key, nums: p.busNums.slice(), paxIds: [] };
-    map[key].paxIds.push(p.id);
   });
+
+  // 3) Poblar cada grupo: entra todo pasajero cuya van pertenezca al grupo,
+  //    venga como "VAN 1 - 2" o como "VAN 1" / "VAN 2" por separado.
+  state.pax.forEach(p => { p.pooled = null; });
   Object.values(map).forEach(g => {
+    state.pax.forEach(p => {
+      const nums = p.busNums || [];
+      if (!nums.length) return;
+      const belongs = p.busMulti
+        ? nums.join('-') === g.key
+        : g.nums.includes(nums[0]);
+      if (belongs && !g.paxIds.includes(p.id)) {
+        g.paxIds.push(p.id);
+        p.pooled = g.id;
+      }
+    });
     g.memberVehicleIds = state.vehicles
       .filter(v => g.nums.includes(vehicleNum(v)))
       .map(v => v.id);
     g.label = 'Van ' + g.nums.join('–');
   });
+
   state.groups = Object.values(map);
 }
 
 function groupById(id) { return (state.groups || []).find(g => g.id === id); }
+
+// Devuelve el grupo compartido al que pertenece un vehículo (o null).
+function groupForVehicle(v) {
+  return (state.groups || []).find(g => (g.memberVehicleIds || []).includes(v.id)) || null;
+}
 
 // Lista efectiva de un vehículo = pax fijos + pax de pool que embarcaron en él.
 function paxForVehicle(v) {
@@ -648,6 +687,11 @@ function paxForVehicle(v) {
   state.pax.forEach(p => {
     const isFixed = fixed.includes(p.id);
     const isPooledHere = p.assignedVan === v.id;
+    // Si está en un pool compartido, solo aparece en la van que lo tomó.
+    if (p.pooled) {
+      if (isPooledHere && !seen.has(p.id)) { seen.add(p.id); out.push(p); }
+      return;
+    }
     // van única cuyo número calza con este vehículo (cubre altas manuales)
     const isSingleMatch = !p.busMulti && vn != null && p.busNums && p.busNums[0] === vn;
     if ((isFixed || isPooledHere || isSingleMatch) && !seen.has(p.id)) { seen.add(p.id); out.push(p); }
@@ -790,7 +834,7 @@ function seedAndShare() {
     const ref = firebase.database().ref('voyages/' + vid.replace(/[.#$/[\]]/g, '_'));
     const initData = { voyageInfo: state.voyage, guides: state.guides, vehicles: {} };
     state.vehicles.forEach(v => {
-      initData.vehicles[v.id] = { name: v.name, icon: v.icon, hotel: v.hotel, capacity: v.capacity, guide: '', paxIds: v.pax || [] };
+      initData.vehicles[v.id] = { name: v.name, icon: v.icon, hotel: v.hotel, capacity: v.capacity, guide: '', groupKey: v.groupKey || null, paxIds: v.pax || [] };
     });
     const allPax = {};
     state.pax.forEach(p => { allPax[p.id] = { ...p, checked: false, assist: false, assignedVan: null }; });
@@ -882,16 +926,36 @@ function mergeSetupIntoFirebase(voyageRef, existing) {
     Object.keys(existing.vehicles).forEach(id => { const m = String(id).match(/\d+/); if (m) maxN = Math.max(maxN, +m[0]); });
   }
   let added = 0;
+  let regrouped = 0;
+  // Índice de los vehículos ya guardados, por nombre → id de Firebase
+  const idByName = {};
+  if (existing.vehicles) {
+    Object.entries(existing.vehicles).forEach(([id, v]) => {
+      idByName[String(v.name || '').trim().toLowerCase()] = { id, data: v };
+    });
+  }
   (state.vehicles || []).forEach(v => {
     const key = String(v.name || '').trim().toLowerCase();
-    if (key && !existingNames.has(key)) {
+    if (!key) return;
+    if (!existingNames.has(key)) {
       maxN++;
       const id = 'v' + maxN;
       voyageRef.child('vehicles/' + id).set({
-        name: v.name, icon: v.icon, hotel: v.hotel, capacity: v.capacity, guide: '', paxIds: v.pax || []
+        name: v.name, icon: v.icon, hotel: v.hotel, capacity: v.capacity, guide: '', groupKey: v.groupKey || null, paxIds: v.pax || []
       });
       existingNames.add(key);
+      idByName[key] = { id, data: v };
       added++;
+    } else {
+      // Ya existe: actualizar la marca de grupo si cambió (ej. ahora es "Van 1 - 2")
+      const ex = idByName[key];
+      const newKey = v.groupKey || null;
+      if (ex && (ex.data.groupKey || null) !== newKey) {
+        voyageRef.child('vehicles/' + ex.id + '/groupKey').set(newKey);
+        const localV = state.vehicles.find(x => String(x.name || '').trim().toLowerCase() === key);
+        if (localV) localV.id = ex.id;   // alinear con el id real de Firebase
+        regrouped++;
+      }
     }
   });
   // Guías: unir sin duplicar
@@ -899,6 +963,7 @@ function mergeSetupIntoFirebase(voyageRef, existing) {
   const merged = [...new Set([...existingGuides, ...(state.guides || [])].map(g => String(g).trim()).filter(Boolean))];
   if (merged.length !== existingGuides.length) voyageRef.child('guides').set(merged);
   if (added) showToast(added + ' vehículo(s) agregado(s) a la operación');
+  if (regrouped) showToast(regrouped + ' van(s) marcadas como grupo compartido');
 }
 
 function initFirebase() {
@@ -919,7 +984,7 @@ function initFirebase() {
       state.vehicles.forEach(v => {
         initData.vehicles[v.id] = {
           name: v.name, icon: v.icon, hotel: v.hotel, capacity: v.capacity,
-          guide: '', paxIds: v.pax || []
+          guide: '', groupKey: v.groupKey || null, paxIds: v.pax || []
         };
       });
       const allPax = {};
@@ -1140,6 +1205,51 @@ function buildVehicleCard(v) {
     ${present.length} presentes · ${absent.length} no llegaron · ${boarded.length} embarcados
   </span>`;
 
+  // ── Pool compartido: si esta van comparte pasajeros con otra(s) ──
+  // Ambos guías ven la MISMA lista desde su propia van y toman al que llegue.
+  let poolSection = '';
+  const grp = groupForVehicle(v);
+  if (grp) {
+    const siblings = (grp.memberVehicleIds || [])
+      .map(id => state.vehicles.find(x => x.id === id))
+      .filter(x => x && x.id !== v.id);
+    const poolPax = state.pax.filter(p => grp.paxIds.includes(p.id));
+    const pending = poolPax.filter(p => !p.assignedVan && p.presence !== 'absent');
+
+    const counts = (grp.memberVehicleIds || []).map(id => {
+      const mv = state.vehicles.find(x => x.id === id);
+      if (!mv) return '';
+      const n = poolPax.filter(p => p.assignedVan === mv.id).length;
+      return `<span class="tag ${mv.id === v.id ? 'tag-green' : ''}">${mv.name}: ${n}</span>`;
+    }).join(' ');
+
+    const pendingRows = pending.map(p => `
+      <div class="pax-row" style="flex-wrap:wrap">
+        <div class="pax-info" style="min-width:120px">
+          <div class="pax-name">${p.lastName}, ${p.firstName}${p.manual ? ' <span class="tag tag-blue">agregado</span>' : ''}</div>
+          <div class="pax-meta">${[p.cabin ? 'Cab. ' + p.cabin : '', p.booking].filter(Boolean).join(' · ')}</div>
+        </div>
+        <button class="van-btn" style="background:var(--green);border-color:var(--green);color:#fff"
+          onclick="assignPoolPax('${p.id}','${v.id}')">⬆ Sube a ${v.name}</button>
+        <button class="presence-btn" onclick="cyclePresence('${p.id}')" title="No llegó">✗</button>
+      </div>`).join('');
+
+    poolSection = `
+      <div class="pool-sec">
+        <div class="pool-head">
+          👥 Pool compartido con ${siblings.map(s => s.name).join(', ') || 'otra van'}
+          <span style="font-weight:400;color:var(--txt2)"> · ${pending.length} por asignar de ${poolPax.length}</span>
+        </div>
+        <div style="padding:4px 16px 8px">${counts}</div>
+        ${pendingRows || '<div class="empty-state" style="padding:10px 16px">Todos los del pool ya están asignados</div>'}
+        <div class="add-pax" style="border-top:none;padding-top:0">
+          <input id="addpax-last-${grp.id}" placeholder="Apellido" autocomplete="off">
+          <input id="addpax-first-${grp.id}" placeholder="Nombre" autocomplete="off">
+          <button onclick="addManualPax('${grp.id}', true)">＋ Agregar al pool</button>
+        </div>
+      </div>`;
+  }
+
   return `
     <div class="vc">
       <div class="vc-head">
@@ -1162,6 +1272,7 @@ function buildVehicleCard(v) {
         <div class="prog-lbl">${stats}</div>
       </div>
       ${paxRows ? `<div>${paxRows}</div>` : '<div class="empty-state">Sin pasajeros asignados</div>'}
+      ${poolSection}
       <div class="add-pax">
         <input id="addpax-last-${v.id}" placeholder="Apellido" autocomplete="off">
         <input id="addpax-first-${v.id}" placeholder="Nombre" autocomplete="off">
@@ -1634,6 +1745,45 @@ function saveTripField(vehicleId, field, value) {
 // ─── COORD VIEW ───────────────────────────────────────────
 // Agrega un vehículo/traslado a mano durante la operación (vista coordinador).
 // Se divide solo si es un grupo (ej. "Van 5 - 6") y se sincroniza por Firebase.
+// Une dos o más vans existentes en un pool compartido, en vivo.
+// Ej: escribir "1-2" junta Van 1 y Van 2 y sus pasajeros pasan a lista común.
+function linkVansAsGroup() {
+  const el = document.getElementById('link-vans');
+  const spec = el ? el.value.trim() : '';
+  const nums = [...new Set((spec.match(/\d+/g) || []).map(Number))];
+  if (nums.length < 2) { showToast('Escribe al menos dos vans, ej: 1-2'); return; }
+
+  const targets = state.vehicles.filter(v => nums.includes(vehicleNum(v)));
+  if (targets.length < 2) { showToast('No encuentro esas vans en la operación'); return; }
+
+  const gKey = nums.slice().sort((a, b) => a - b).join('-');
+  const voyageRef = db ? db.ref('voyages/' + state.voyage.id.replace(/[.#$/[\]]/g, '_')) : null;
+  targets.forEach(v => {
+    v.groupKey = gKey;
+    if (voyageRef) voyageRef.child('vehicles/' + v.id + '/groupKey').set(gKey);
+  });
+  buildGroups();
+  logAction('🔗 Vans unidas en pool: ' + targets.map(v => v.name).join(' + '));
+  showToast('Pool creado: ' + targets.map(v => v.name).join(' + '));
+  renderCoordView();
+  if (activeTab === 'guia') renderGuiaView();
+}
+
+// Deshace un pool (las vans vuelven a tener su lista fija).
+function unlinkVans(groupId) {
+  const g = groupById(groupId);
+  if (!g) return;
+  const voyageRef = db ? db.ref('voyages/' + state.voyage.id.replace(/[.#$/[\]]/g, '_')) : null;
+  (g.memberVehicleIds || []).forEach(id => {
+    const v = state.vehicles.find(x => x.id === id);
+    if (v) { v.groupKey = null; if (voyageRef) voyageRef.child('vehicles/' + id + '/groupKey').set(null); }
+  });
+  buildGroups();
+  showToast('Pool deshecho');
+  renderCoordView();
+  if (activeTab === 'guia') renderGuiaView();
+}
+
 function addVehicleLive() {
   const nameEl = document.getElementById('newveh-name');
   const hotelEl = document.getElementById('newveh-hotel');
@@ -1648,12 +1798,15 @@ function addVehicleLive() {
 
   const voyageRef = db ? db.ref('voyages/' + state.voyage.id.replace(/[.#$/[\]]/g, '_')) : null;
   const names = expandVehicleName(raw);
+  const gKey = names.length > 1
+    ? names.map(n => (String(n).match(/\d+/) || [''])[0]).join('-')
+    : null;
   names.forEach(nm => {
     maxN++;
     const id = 'v' + maxN;
-    const v = { id, name: nm, icon: '🚌', hotel, capacity: cap, guide: '', pax: [] };
+    const v = { id, name: nm, icon: '🚌', hotel, capacity: cap, guide: '', groupKey: gKey, pax: [] };
     state.vehicles.push(v);
-    if (voyageRef) voyageRef.child('vehicles/' + id).set({ name: nm, icon: '🚌', hotel, capacity: cap, guide: '', paxIds: [] });
+    if (voyageRef) voyageRef.child('vehicles/' + id).set({ name: nm, icon: '🚌', hotel, capacity: cap, guide: '', groupKey: gKey, paxIds: [] });
   });
   buildGroups();
   logAction('＋ Vehículo agregado: ' + names.join(', '));
@@ -1721,6 +1874,10 @@ function renderCoordView() {
     <div class="section-title">Por vehículo</div>
     ${vehicleRows || '<div class="empty-state">Sin vehículos configurados</div>'}
     ${groupRows ? `<div class="section-title">Grupos compartidos</div>${groupRows}` : ''}
+    <div class="add-pax" style="border-top:0.5px solid var(--border);margin-top:6px">
+      <input id="link-vans" placeholder="Unir vans en un pool (ej. 1-2)" autocomplete="off" style="flex:1 1 100%">
+      <button onclick="linkVansAsGroup()">🔗 Unir vans</button>
+    </div>
     <div class="add-pax" style="border-top:0.5px solid var(--border);margin-top:6px">
       <input id="newveh-name" placeholder="Vehículo (ej. Van 5  ·  o  Van 5 - 6)" autocomplete="off" style="flex:1 1 100%">
       <input id="newveh-hotel" placeholder="Hotel" autocomplete="off">
